@@ -1,0 +1,348 @@
+SQL_DDL_Func — Task 6: Analysis of Existing dvdrental Functions
+================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 1: What operations do the following functions perform?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+film_in_stock(p_film_id, p_store_id, OUT p_film_count)
+
+I looked at this function and what it does is pretty simple — it queries the inventory
+table and returns the inventory_ids of all copies of a given film at a given store
+that are currently available. To decide if a copy is available it calls
+inventory_in_stock(inventory_id) for each row, and only keeps the ones where that
+returns TRUE. The OUT parameter p_film_count fills in automatically with however many
+rows came back.
+
+
+film_not_in_stock(p_film_id, p_store_id, OUT p_film_count)
+
+This is basically the same function as film_in_stock, just flipped. The only real
+difference in the code is AND NOT inventory_in_stock(inventory_id). So instead of
+returning available copies, it returns the ones that are currently checked out.
+Same logic, opposite filter.
+
+
+inventory_in_stock(p_inventory_id)
+
+This one checks whether a specific copy (inventory item) is currently available.
+It does it in two steps. First it counts all rentals for that inventory_id —
+if there are zero, the item was never rented so it's definitely in stock and the
+function returns TRUE right away. If there were rentals, it then counts how many
+of them have a non-null return_date (meaning they were returned). If that count is
+greater than zero, it returns TRUE. There is actually a bug in this logic and I'll
+talk about it in the "incorrect results" question.
+
+
+get_customer_balance(p_customer_id, p_effective_date)
+
+This function calculates how much a customer owes as of a given date. It builds
+the answer from three pieces. First it sums up all the rental_rate charges for
+every film this customer rented up to that date. Then it calculates any overdue
+fees for rentals that were returned late. Then it subtracts all payments the
+customer made up to that date. The final result is charges minus payments —
+a positive number means the customer still owes money. There is a problem with the
+overdue calculation though, I'll cover that below.
+
+
+inventory_held_by_customer(p_inventory_id)
+
+This is the simplest one I found. It just looks in the rental table for a row where
+return_date IS NULL and inventory_id matches the input. If it finds one, it returns
+that customer_id — meaning that customer currently has the DVD. If nobody has it,
+it returns NULL.
+
+
+rewards_report(min_monthly_purchases, min_dollar_amount_purchased)
+
+This function is supposed to find customers who qualify for a rewards program based
+on how much they spent and how many times they rented in the last month. The way it
+works: it calculates a date range for "last month", then builds a SQL query as a
+text string, runs it with EXECUTE to collect qualifying customer_ids into a temp
+table, and then returns full customer rows for those ids. I'll explain why this
+returns 0 rows and how I fixed it below.
+
+
+last_day(TIMESTAMPTZ)
+
+This one just returns the last calendar day of the month for a given timestamp.
+If the month is December it constructs January 1st of the next year and subtracts
+one day. For any other month it constructs the 1st of the next month and subtracts
+one day. It's marked IMMUTABLE STRICT so PostgreSQL can cache the result and skips
+calling it entirely when the input is NULL. It's used inside rewards_report to find
+the end of the "last month" date range.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 2: Why does rewards_report return 0 rows? Fix and recreate it.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The problem is this line:
+    last_month_start := CURRENT_DATE - '3 month'::interval;
+
+When I run this in 2026 it produces a date somewhere in late 2025. But all the
+payment data in dvdrental is from 2007. So the WHERE clause is filtering for
+payments in a date range that simply doesn't exist in the database — which is
+why you always get 0 rows.
+
+There is also a second issue I noticed: the function does CREATE TEMP TABLE tmpCustomer
+every time it runs, but if you call it twice in the same session it crashes with
+"relation already exists" because the temp table is still there from the first call.
+
+To fix both problems I replaced CURRENT_DATE with MAX(payment_date) from the actual
+data, so the function always anchors itself to the real data regardless of when it's
+run. I also removed the temp table and the dynamic SQL entirely (more on that in
+question 8) and rewrote it as a plain RETURN QUERY.
+
+CREATE OR REPLACE FUNCTION rewards_report(
+    min_monthly_purchases       INTEGER,
+    min_dollar_amount_purchased NUMERIC
+)
+RETURNS SETOF customer
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    last_month_start DATE;
+    last_month_end   DATE;
+    v_max_date       DATE;
+BEGIN
+    IF min_monthly_purchases = 0 THEN
+        RAISE EXCEPTION 'Minimum monthly purchases parameter must be > 0';
+    END IF;
+    IF min_dollar_amount_purchased = 0.00 THEN
+        RAISE EXCEPTION 'Minimum monthly dollar amount purchased parameter must be > $0.00';
+    END IF;
+
+    -- I anchor to the latest payment date in the actual data instead of CURRENT_DATE
+    -- so this works correctly no matter when the function is called
+    SELECT MAX(DATE(payment_date)) INTO v_max_date FROM payment;
+
+    last_month_start := DATE_TRUNC('month', v_max_date - INTERVAL '1 month')::DATE;
+    last_month_end   := (DATE_TRUNC('month', v_max_date) - INTERVAL '1 day')::DATE;
+
+    RETURN QUERY
+    SELECT c.*
+    FROM customer c
+    WHERE c.customer_id IN (
+        SELECT p.customer_id
+        FROM payment p
+        WHERE DATE(p.payment_date) BETWEEN last_month_start AND last_month_end
+        GROUP BY p.customer_id
+        HAVING SUM(p.amount)       > min_dollar_amount_purchased
+           AND COUNT(p.payment_id) > min_monthly_purchases
+    );
+END;
+$$;
+
+-- Test:
+SELECT * FROM rewards_report(3, 20);
+-- Expected: customer rows who had more than 3 payments and spent more than $20
+-- in the last month of the available data (which is around May 2007)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 3: Is there any function that can be removed (inefficient or redundant)?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+I think film_not_in_stock is a good candidate for removal. Looking at the code,
+it does exactly the same thing as film_in_stock — same join, same filter — just
+with NOT in front of inventory_in_stock(). Any place that calls film_not_in_stock
+could just query inventory directly with NOT inventory_in_stock(inventory_id) and
+get the same result. Having two separate functions for this doubles the maintenance
+work and adds confusion about which one to use.
+
+I would also mention last_day(). It was probably added because the database was
+ported from MySQL, where LAST_DAY() is a built-in function. In modern PostgreSQL
+I can just write:
+    DATE_TRUNC('month', date) + INTERVAL '1 month' - INTERVAL '1 day'
+So the custom function is no longer needed.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 4: Which functions violate best practices?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+inventory_in_stock — there is a logical error in the code.
+Step 2 counts how many rentals for this inventory_id have return_date IS NOT NULL,
+and if that count is greater than zero it returns TRUE (available). But the problem
+is that this doesn't check whether there is ALSO an active rental right now. So if
+a copy has three returned rentals and one currently active rental, v_out = 3 which
+is > 0, so the function says it's available — but it's not, someone has it. I'll
+show the correct version in question 9.
+
+get_customer_balance — it uses IF() which is MySQL syntax.
+PostgreSQL doesn't have IF() as a SQL expression function. This means the function
+will crash with an error every time it's called, before it even gets to return a
+result. The correct PostgreSQL way is CASE WHEN ... THEN ... ELSE ... END.
+
+rewards_report — a few things bother me here.
+First, the dynamic SQL (tmpSQL + EXECUTE) isn't necessary at all for this kind of
+query — I'll explain more in question 8. Second, the temp table is created without
+checking if it already exists, so calling the function twice in the same session
+breaks it. Third, the function has SECURITY DEFINER but no SET search_path = public,
+which is a known security risk — a user could potentially manipulate the search path
+and cause the function to run against different tables.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 5: Fix get_customer_balance using requirements from comments
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Reading through the comments in the function I can see it's meant to compute:
+  1) rental fees   = sum of rental_rate for all rentals up to p_effective_date
+  2) overdue fees  = extra charge for rentals returned late
+  3) payments      = subtract what the customer already paid
+
+The structure is right, the main issue is that v_overfees uses IF() which breaks
+in PostgreSQL. I also noticed that the overdue calculation returns an interval
+instead of a numeric dollar amount — so I fixed that too by converting the overdue
+days to a number and treating it as $1 per day overdue, which matches the intent
+in the comments.
+
+CREATE OR REPLACE FUNCTION get_customer_balance(
+    p_customer_id    INTEGER,
+    p_effective_date TIMESTAMPTZ
+)
+RETURNS NUMERIC
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_rentfees DECIMAL(5,2);
+    v_overfees DECIMAL(5,2);
+    v_payments DECIMAL(5,2);
+BEGIN
+    -- rental fees: total rental_rate for all rentals up to the effective date
+    SELECT COALESCE(SUM(f.rental_rate), 0) INTO v_rentfees
+    FROM film f
+    JOIN inventory i ON f.film_id      = i.film_id
+    JOIN rental r    ON i.inventory_id = r.inventory_id
+    WHERE r.customer_id  = p_customer_id
+      AND r.rental_date <= p_effective_date;
+
+    -- overdue fees: $1 per day the item was returned late.
+    -- I replaced IF() with CASE WHEN because IF() is MySQL syntax and doesn't work in PostgreSQL.
+    -- I also extract the number of overdue days as a numeric value instead of leaving it as an interval.
+    SELECT COALESCE(SUM(
+        CASE
+            WHEN r.return_date IS NOT NULL
+             AND (r.return_date - r.rental_date) > (f.rental_duration * INTERVAL '1 day')
+            THEN EXTRACT(EPOCH FROM
+                    (r.return_date - r.rental_date) - (f.rental_duration * INTERVAL '1 day')
+                 ) / 86400.0
+            ELSE 0
+        END
+    ), 0) INTO v_overfees
+    FROM film f
+    JOIN inventory i ON f.film_id      = i.film_id
+    JOIN rental r    ON i.inventory_id = r.inventory_id
+    WHERE r.customer_id  = p_customer_id
+      AND r.rental_date <= p_effective_date;
+
+    -- payments: total amount paid by the customer up to the effective date
+    SELECT COALESCE(SUM(amount), 0) INTO v_payments
+    FROM payment
+    WHERE customer_id   = p_customer_id
+      AND payment_date <= p_effective_date;
+
+    RETURN v_rentfees + v_overfees - v_payments;
+END;
+$$;
+
+-- Test:
+SELECT get_customer_balance(1, NOW());
+-- Expected: a numeric balance (positive = still owes money, negative = overpaid)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 6: How do group_concat and _group_concat work? Where are they used?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These two work together as a custom aggregate. _group_concat is the state transition
+function — it gets called once per row and appends the new value to whatever has been
+accumulated so far, separated by a comma. So after processing three rows it produces
+something like "value1, value2, value3". group_concat is the aggregate wrapper that
+tells PostgreSQL to use _group_concat as the transition function.
+
+The reason this exists is that dvdrental was ported from MySQL, and MySQL has a
+built-in GROUP_CONCAT() function that does exactly this. PostgreSQL didn't have a
+native equivalent at the time, so these were added manually to replicate that behavior.
+
+They are used in the film_list and nicer_but_slower_film_list views to build a
+comma-separated list of actor names for each film. In modern PostgreSQL I would just
+use STRING_AGG(actor_name, ', ') and skip these custom functions entirely.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 7: What does last_updated do? Where is it used?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+last_updated() is a trigger function. Its entire body is just:
+    NEW.last_update := NOW();
+    RETURN NEW;
+
+So every time a row is inserted or updated in a table that has this trigger,
+the last_update column automatically gets set to the current timestamp.
+The application doesn't need to manage this — the database handles it.
+
+It's attached as a BEFORE trigger on pretty much every table in dvdrental:
+actor, address, category, city, country, customer, film, film_actor, film_category,
+inventory, language, rental, staff, and store. It's a standard audit pattern to
+always know when a record was last touched.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 8: What is tmpSQL in rewards_report? Can it work without EXECUTE?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+tmpSQL is a TEXT variable that holds the full SQL query built as a string by
+concatenating the function parameters into it. For example when you call
+rewards_report(3, 20) it builds a string that looks roughly like:
+
+    SELECT c.customer_id FROM customer c
+    INNER JOIN payment p ON c.customer_id = p.customer_id
+    WHERE DATE(p.payment_date) BETWEEN '2007-04-01' AND '2007-04-30'
+    GROUP BY c.customer_id
+    HAVING SUM(p.amount) > '20' AND COUNT(p.payment_id) > '3'
+
+Then EXECUTE runs that string as a query.
+
+Can it be rewritten without EXECUTE? Yes, definitely. Dynamic SQL with EXECUTE is
+really only needed when the structure of the query changes at runtime — like when you
+have a variable table name or column name. Here the query structure never changes,
+only the filter values change. Those can just be passed in as regular parameters to
+a normal RETURN QUERY statement, which is what I did in my fixed version in question 2.
+The result is much cleaner code and there's no SQL injection risk from string concatenation.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUESTION 9: Can any function produce incorrect results? Why?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Yes, two of them have this problem.
+
+inventory_in_stock can return wrong results. The bug is in step 2 — it counts
+how many rentals have return_date IS NOT NULL and if that count is > 0 it returns
+TRUE (meaning "available"). But this doesn't account for the case where a copy has
+some past returned rentals AND also an active rental right now. In that situation
+v_out > 0 so the function says the item is available, even though someone currently
+has it checked out. A concrete example: if inventory_id 10 has two records in rental —
+one returned in 2007 and one with return_date IS NULL (active right now) — the function
+still returns TRUE because it only checks if any rental was returned, not whether all
+of them were. The correct logic is much simpler:
+
+    RETURN NOT EXISTS (
+        SELECT 1 FROM rental
+        WHERE inventory_id = p_inventory_id
+          AND return_date IS NULL
+    );
+
+This returns TRUE only if there is no active (unreturned) rental for that item,
+which is the actual definition of "in stock".
+
+get_customer_balance won't return incorrect results — it won't return any results
+at all, because the IF() function call in the overdue calculation is MySQL syntax
+and PostgreSQL will throw an error before the function finishes. So technically it
+can't produce wrong numbers, but it also can't produce correct ones. The fix is in
+question 5 where I replaced IF() with CASE WHEN.
