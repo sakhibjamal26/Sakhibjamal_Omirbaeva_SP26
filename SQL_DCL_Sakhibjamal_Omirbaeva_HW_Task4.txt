@@ -1,0 +1,333 @@
+
+  dvd_rental Database —  Theory Questions
+  by Sakhibjamal Omirbaeva
+
+
+QUESTION 1. How can one restrict access to certain columns
+            of a database table?
+----------------------------------------------------------------
+
+There are two main ways to do column-level access control
+in PostgreSQL.
+
+The first and most straightforward way is column-level GRANT.
+Instead of granting SELECT on the whole table, you can grant
+it only on specific columns:
+
+  GRANT SELECT (first_name, last_name, email)
+      ON TABLE customer
+      TO rentaluser;
+
+This means rentaluser can run:
+
+  SELECT first_name, last_name, email FROM customer;  -- works
+
+But this will fail:
+
+  SELECT * FROM customer;
+  -- ERROR: permission denied for table customer
+  SELECT customer_id, address_id FROM customer;
+  -- ERROR: permission denied for table customer
+
+I found this really useful to know — I didn't realize you could
+be that specific with GRANT. It means you can expose just the
+columns that a role actually needs.
+
+
+The second way is to create a VIEW that only exposes certain
+columns, and then grant SELECT on the view instead of the table:
+
+  CREATE VIEW customer_public_info AS
+      SELECT customer_id, first_name, last_name, email
+      FROM customer;
+
+  GRANT SELECT ON customer_public_info TO rentaluser;
+
+The user queries the view and never sees the underlying table
+or its hidden columns (like address_id or store_id).
+
+Practical example from dvd_rental:
+The staff table contains a password column. You would never
+want an application role to be able to read that. So instead
+of granting SELECT on the whole staff table, you could do:
+
+  GRANT SELECT (staff_id, first_name, last_name, email, store_id)
+      ON TABLE staff
+      TO rentaluser;
+  -- password column is simply not listed, so it stays hidden
+
+I will write real-world scenarios based on my current job, after completing task1, this topic became more interesting to me, I made more deep dive in production scenarios, looked through corporate documentations and tried to understand how it was all implemented on database with over 23 million registered users. 
+
+Real-world scenario:
+This is actually something I deal with at work as a data
+analyst, and column-level security comes up
+a lot in practice. For example, our credit scoring models work
+with customer financial data — income, loan history, repayment
+behavior. Not everyone on the team needs to see all of that.
+A junior analyst might get SELECT on the feature columns but
+not on raw personal identifiers like national ID numbers or
+phone numbers. The DBA creates views or uses column grants
+so that each role only sees what it actually needs for its job.
+The same logic applies here with dvd_rental — just at a much
+smaller scale.
+
+
+
+
+
+QUESTION 2. What is the difference between user identification
+            and user authentication?
+----------------------------------------------------------------
+
+These two concepts are related but they are not the same thing,
+and I think it is easy to confuse them at first.
+
+Identification is the step where the user says who they are.
+It is just a claim. For example, when I type:
+
+  psql -U rentaluser -d dvdrental
+
+I am identifying myself as rentaluser. PostgreSQL now knows
+who I claim to be.
+
+Authentication is the step where that claim is actually verified.
+The system checks: is this person really rentaluser? This is
+where a password, a certificate, or some other proof comes in.
+
+A simple way I remember the difference:
+  - Identification = "I am rentaluser"
+  - Authentication = "Prove it"
+
+In PostgreSQL this maps directly to pg_hba.conf. The "user"
+column handles identification (which user is connecting), and
+the "auth_method" column handles authentication (how they prove
+it):
+
+  # pg_hba.conf
+  host  dvdrental  rentaluser  127.0.0.1/32  scram-sha-256
+  --                                          ^^^^^^^^^^^^
+  --                           authentication method (prove it)
+
+With auth_method = trust there is identification but NO real
+authentication — anyone can claim to be any user. That was
+actually the big vulnerability I found in Task 1.
+
+Practical example from dvd_rental:
+When the dvd_rental app connects as rentaluser, PostgreSQL
+first identifies the connecting session (step 1: "this session
+says it is rentaluser"), then authenticates it by checking the
+password hash against pg_authid (step 2: "ok, the password
+matches — identity confirmed").
+
+Real-world scenario:
+At the digital bank where I work, this distinction is taken very
+seriously. When I connect to our internal databases to run
+analytics queries, I first identify myself with my username
+(identification), and then I have to pass through two layers
+of verification — a password and a one-time code from an
+authenticator app (authentication). It's the same concept
+as in PostgreSQL, just with an extra factor added on top.
+The reason banks are strict about this is that a failed
+identification is just a typo, but a failed authentication
+means someone tried to access data they shouldn't. Those
+two events are logged very differently and trigger different
+alerts.
+
+
+
+
+QUESTION 3. What are the recommended authentication protocols
+            for PostgreSQL?
+----------------------------------------------------------------
+
+PostgreSQL supports several authentication methods and they are
+configured per connection type in pg_hba.conf. Here are the
+most important ones, from weakest to strongest:
+
+trust
+  No authentication at all. Anyone who can connect and claims
+  to be a user is accepted. Fine for local development, never
+  for production. This is what dvd_rental has by default
+  (which is what I flagged in Task 1).
+
+password
+  Sends the password in plain text over the network. Insecure
+  unless combined with SSL. Should not be used in production.
+
+md5
+  Sends an MD5 hash of the password. Better than plain text
+  but MD5 is now considered weak because it is vulnerable to
+  brute force and rainbow table attacks. Many older PostgreSQL
+  setups still use this.
+
+scram-sha-256
+  This is the current recommended method. It uses the SCRAM
+  protocol with SHA-256, which means:
+    - The password is never sent over the network directly
+    - It is resistant to replay attacks
+    - Even if someone intercepts the exchange, they can't
+      recover the password from it
+  Available since PostgreSQL 10.
+
+  Example setup in pg_hba.conf:
+
+    host  dvdrental  all  0.0.0.0/0  scram-sha-256
+
+  And create users with passwords:
+
+    CREATE ROLE rentaluser LOGIN PASSWORD 'rentalpassword';
+
+cert
+  Uses SSL client certificates instead of passwords. The user
+  presents a certificate signed by a trusted CA. Very secure
+  but requires more infrastructure to set up.
+
+peer / ident
+  For local connections only. PostgreSQL checks the OS username
+  of the connecting process. If the OS user is "alice" then
+  PostgreSQL accepts a connection as role "alice" without a
+  password. Useful for system services on the same machine.
+
+  Example from dvd_rental local setup:
+
+    local  all  postgres  peer
+    -- postgres OS user can connect as postgres role without password
+
+ldap / radius / gss / sspi
+  Enterprise-level methods that delegate authentication to an
+  external system (Active Directory, LDAP server, Kerberos).
+  Common in corporate environments.
+
+Recommended for production:
+  - scram-sha-256 for password-based auth (current best practice)
+  - cert for service-to-service communication
+  - peer for trusted local system processes
+  - Always combine with SSL (ssl = on in postgresql.conf)
+
+Practical example from dvd_rental:
+If I were deploying this for real, I would set:
+
+  # local admin access
+  local  dvdrental  postgres     peer
+  # app connections over network
+  host   dvdrental  rentaluser   0.0.0.0/0  scram-sha-256
+
+Real-world scenario:
+At work, we deal with customer financial data
+every day, so the authentication standards are much stricter
+than what dvd_rental has out of the box. Our PostgreSQL
+instances use scram-sha-256 for service account connections,
+and all traffic goes over SSL — unencrypted database connections
+simply aren't allowed by policy. For internal analyst access
+(like me running queries for credit risk or model monitoring),
+we also go through an LDAP-based auth layer tied to our
+corporate identity system. That way there is one central place
+to manage access — if someone leaves the team, their access
+is revoked everywhere at once without touching every database
+manually. It's a good reminder that these PostgreSQL settings
+are not just theory — they directly affect how safely the bank
+can operate.
+
+
+
+QUESTION 4. What is proxy authentication in PostgreSQL and
+            what is it for? Why does it make role-based access
+            control easier to implement?
+----------------------------------------------------------------
+
+Proxy authentication (also called "user impersonation") is a
+pattern in PostgreSQL where one role connects to the database
+and then switches to act as another role during the session.
+The key command for this is SET ROLE.
+
+How it works:
+
+  -- Connect as the "proxy" user:
+  psql -U app_proxy -d dvdrental
+
+  -- Then inside the session, switch to a specific role:
+  SET ROLE rentaluser;
+
+  -- Now you have rentaluser's permissions, not app_proxy's
+  SELECT * FROM customer;  -- works if rentaluser has SELECT
+
+  -- Switch back when done:
+  RESET ROLE;
+
+For this to work, app_proxy needs to be a member of rentaluser:
+
+  GRANT rentaluser TO app_proxy;
+
+There is also a more formal version using SET SESSION
+AUTHORIZATION, which goes even deeper and changes the session
+user (not just the current role), but SET ROLE is the more
+common approach.
+
+Why is this useful for role-based access control?
+
+Without proxy auth, every individual role that needs database
+access must have a LOGIN and its own password. If you have
+100 customers, you need 100 login roles, 100 passwords, and
+100 separate pg_hba.conf entries to manage.
+
+With proxy auth, you have just ONE login role (the proxy user)
+that the application connects with. The application then does
+SET ROLE client_mary_smith (or whoever the current user is)
+after login, and all permissions are applied correctly.
+
+  -- Application connects once as proxy:
+  CONNECT as app_proxy WITH PASSWORD '...'
+
+  -- Then per-user logic:
+  SET ROLE client_mary_smith;
+  SELECT * FROM rental;   -- RLS kicks in, only Mary's rows
+
+  SET ROLE client_patricia_johnson;
+  SELECT * FROM rental;   -- now Patricia's rows only
+
+This is much easier to manage because:
+  - Only one set of credentials to protect (app_proxy password)
+  - pg_hba.conf only needs one entry for the proxy user
+  - Adding a new customer role does not require a new login
+  - The application handles the role switching logic
+
+Practical example from dvd_rental:
+In Task 2 I created client_mary_smith with a LOGIN and password.
+That works fine for demonstration purposes, but in a real
+system with 599 customers in the dvd_rental database, creating
+599 login roles is not realistic. Instead:
+
+  -- One proxy role for the whole application:
+  CREATE ROLE dvdrental_proxy LOGIN PASSWORD 'proxypass!';
+
+  -- All customer roles are non-login:
+  CREATE ROLE client_mary_smith;       -- no LOGIN
+  CREATE ROLE client_patricia_johnson; -- no LOGIN
+
+  -- Proxy can switch to any of them:
+  GRANT client_mary_smith       TO dvdrental_proxy;
+  GRANT client_patricia_johnson TO dvdrental_proxy;
+
+  -- In the application, after authenticating Mary:
+  SET ROLE client_mary_smith;
+  -- RLS policies now apply for Mary's customer_id
+
+Real-world scenario:
+This pattern is very relevant to what I do in production environments. We
+have different teams — credit risk, antifraud, data engineering,
+compliance — and each team has different levels of access to
+the same underlying tables. Instead of creating a separate
+database login for every analyst, we have service accounts
+(proxy roles) per team, and individual analyst roles are
+granted as members. When I run queries for credit scoring
+model work, the connection goes through the risk team's
+service account and then switches to my analyst role, which
+has access to the feature tables and model monitoring data
+but not to raw customer PII or payment transaction details.
+
+It also makes offboarding clean — if someone leaves the team,
+you just remove their role from the group. The proxy account
+and all other team members are unaffected. That's something
+I genuinely appreciate working in a regulated environment,
+because access control mistakes in banking are not just
+an inconvenience — they can be a compliance issue.
