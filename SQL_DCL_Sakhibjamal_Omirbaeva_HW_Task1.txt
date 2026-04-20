@@ -1,0 +1,268 @@
+
+  dvd_rental Database — Security Audit
+  by Sakhibjamal Omirbaeva
+
+
+
+1. PURPOSE
+----------
+The task asked me to figure out what security measures are already
+in place in the dvd_rental database. Honestly, I wasn't sure what
+to expect — I had never really looked at PostgreSQL security from
+this angle before. So I used my knowledge learned in self-study course, 
+went through it step by step: roles, table privileges, row-level security, 
+and some database settings.
+Here is what I found.
+
+
+2. USERS AND ROLES
+------------------
+
+First I wanted to see who even exists in this database. I ran:
+
+  SELECT rolname, rolsuper, rolcanlogin, rolconnlimit, rolvaliduntil
+  FROM pg_roles
+  ORDER BY rolname;
+
+Output:
+
+  rolname               | rolsuper | rolcanlogin | rolconnlimit | rolvaliduntil
+  ----------------------+----------+-------------+--------------+--------------
+  postgres              | t        | t           | -1           |
+  pg_monitor            | f        | f           | -1           |
+  pg_read_all_settings  | f        | f           | -1           |
+  pg_read_all_stats     | f        | f           | -1           |
+  pg_signal_backend     | f        | f           | -1           |
+  (5 rows)
+
+So basically only postgres exists as an actual login role. All the
+others are built-in system roles that can't even log in. There is
+no separate role for the application, no read-only role, nothing
+like that. Everything is just... postgres.
+
+I also checked if there are any role memberships:
+
+  SELECT r.rolname AS role, m.rolname AS member_of
+  FROM pg_auth_members am
+  JOIN pg_roles r ON r.oid = am.roleid
+  JOIN pg_roles m ON m.oid = am.member;
+
+  -- Output: (0 rows)
+
+Not surprised — no memberships either. No role hierarchy at all.
+
+
+3. TABLE-LEVEL PRIVILEGES
+--------------------------
+
+Next I checked who has access to what tables:
+
+  SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+  WHERE table_schema = 'public'
+  ORDER BY table_name, privilege_type;
+
+Output:
+
+  grantee  | table_name | privilege_type
+  ---------+------------+----------------
+  postgres | actor      | DELETE
+  postgres | actor      | INSERT
+  postgres | actor      | SELECT
+  postgres | actor      | UPDATE
+  postgres | payment    | SELECT
+  postgres | rental     | SELECT
+  ... (all 16 tables — only grantee is postgres)
+
+Every single privilege on every single table belongs to postgres.
+I kind of expected this after seeing the roles, but it still felt
+a bit shocking to see it confirmed. There is no separation at all —
+if someone connects as postgres they can do literally anything to
+any table.
+
+I also ran this to check default privileges:
+
+  SELECT * FROM pg_default_acl;
+
+  -- Output: (0 rows)
+
+So even future tables would have the same problem automatically.
+
+
+4. ROW-LEVEL SECURITY (RLS)
+----------------------------
+
+This one I was curious about because we talked about RLS in class.
+I wanted to see if it's used anywhere:
+
+  SELECT tablename, rowsecurity
+  FROM pg_tables
+  WHERE schemaname = 'public'
+  ORDER BY tablename;
+
+Output:
+
+  tablename   | rowsecurity
+  ------------+------------
+  actor       | f
+  address     | f
+  category    | f
+  customer    | f
+  film        | f
+  payment     | f
+  rental      | f
+  staff       | f
+  store       | f
+  ... (all 16 tables — rowsecurity = f)
+
+All false. Then I checked if any policies exist at all:
+
+  SELECT * FROM pg_policies WHERE schemaname = 'public';
+
+  -- Output: (0 rows)
+
+Zero policies. RLS is completely unused in this database. To be
+fair, for a simple DVD rental demo it might not be strictly
+necessary, but in a real system with multiple stores or customer
+self-service access, this would be a problem.
+
+
+5. DATABASE-LEVEL SETTINGS
+---------------------------
+
+I also looked at some broader database settings to get the full
+picture.
+
+Connection limit:
+
+  SELECT datname, datconnlimit
+  FROM pg_database
+  WHERE datname = 'dvdrental';
+
+  datname   | datconnlimit
+  ----------+-------------
+  dvdrental | -1
+
+The -1 means there is no limit. Any number of connections can
+come in at once. In production that could become a real issue.
+
+Authentication method (from pg_hba.conf):
+
+  SELECT type, database, user_name, address, auth_method
+  FROM pg_hba_file_rules;
+
+  type  | database | user_name | address   | auth_method
+  ------+----------+-----------+-----------+------------
+  local | {all}    | {all}     |           | trust
+  host  | {all}    | {all}     | 127.0.0.1 | trust
+  host  | {all}    | {all}     | ::1       | trust
+
+This one actually surprised me. auth_method = trust means no
+password is required at all for local connections. Anyone on the
+same machine can just connect as postgres without typing anything.
+
+Other settings:
+
+  SHOW ssl;                -- off
+  SHOW log_connections;    -- off
+  SHOW log_disconnections; -- off
+
+SSL is off, logging is off. So not only is there no authentication,
+there is also no record of who even connected. That's a lot of
+things turned off at once.
+
+
+6. IS IT SUFFICIENT OR RISKY?
+------------------------------
+Honestly — it's risky. I think this setup is fine for learning
+and running examples locally, which is what dvd_rental is designed
+for. But if this were a real production database, it would be a
+serious problem. Here is a quick summary of what concerns me:
+
+  - No password needed to connect (trust mode)
+  - No separate application role — everything is the superuser
+  - No row-level security at all
+  - No connection limit
+  - No audit logging — no way to know what happened after the fact
+  - SSL is off, so data goes over the network unencrypted
+
+The good news is that all of these things can be fixed with
+configuration changes, none of it requires rebuilding the database.
+
+
+7. VULNERABILITY AND SUGGESTED FIX
+------------------------------------
+
+The biggest issue I found is the trust authentication in
+pg_hba.conf. I think this is the most dangerous thing here.
+
+What the problem is:
+Any process running on the same server can connect to PostgreSQL
+as postgres — the superuser — without a password. So if for
+example a web application on the same machine gets hacked, the
+attacker does not need to crack any password. They can just
+connect to the database directly and do whatever they want.
+
+How to fix it:
+
+Step 1 — Change pg_hba.conf to require passwords:
+
+  -- Replace "trust" with "scram-sha-256" for all lines:
+  local   all   all             scram-sha-256
+  host    all   all  127.0.0.1  scram-sha-256
+  host    all   all  ::1        scram-sha-256
+
+  -- Then reload:
+  SELECT pg_reload_conf();
+
+Step 2 — Create a proper application role instead of using postgres:
+
+  CREATE ROLE dvdrental_app LOGIN PASSWORD 'StrongPass123!'
+      NOSUPERUSER NOCREATEDB NOCREATEROLE;
+
+  GRANT CONNECT ON DATABASE dvdrental TO dvdrental_app;
+  GRANT USAGE ON SCHEMA public TO dvdrental_app;
+
+  -- Tables that only need to be read:
+  GRANT SELECT ON film, actor, category, language TO dvdrental_app;
+
+  -- Tables where the app also writes data:
+  GRANT SELECT, INSERT, UPDATE ON rental, payment TO dvdrental_app;
+
+This way even if something goes wrong, the damage is limited to
+what dvdrental_app is allowed to do — not everything.
+
+Step 3 — Turn on at least basic logging:
+
+  -- In postgresql.conf:
+  log_connections = on
+  log_disconnections = on
+  log_min_duration_statement = 1000  -- log queries over 1 second
+
+At least then we would have a record of what happened.
+
+
+8. CONCLUSION
+-------------
+When I started this task I expected to find at least some security
+settings, but the dvd_rental database basically has none. Which
+makes sense — it's a demo database meant for practicing SQL, not
+for running in production.
+
+The three changes I would make if this were a real system:
+
+  1. Switch pg_hba.conf from trust to scram-sha-256
+  2. Create an application role with only the needed permissions
+  3. Enable connection and query logging
+
+RLS is not urgent for this specific case since it's a single
+store, but would be worth adding if the system ever needed to
+support multiple tenants or customer-facing queries.
+
+Overall this was a useful exercise — I learned that checking
+pg_roles and pg_hba_file_rules gives a pretty complete picture
+of who can access what, and that the default PostgreSQL setup
+is quite open by design. In my current rule, as a data analyst, I 
+have never seen database from this view, the activity was fun!
+
+================================================================
