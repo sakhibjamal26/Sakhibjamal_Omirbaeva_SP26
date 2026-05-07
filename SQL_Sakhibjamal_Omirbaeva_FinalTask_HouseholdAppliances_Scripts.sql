@@ -279,7 +279,11 @@ CREATE TABLE orders (
     -- DEFAULT 'pending' because new orders always start in this
     -- status — the app doesn't have to send it explicitly.
     total_amount    NUMERIC(14,2) NOT NULL DEFAULT 0,
-    record_ts       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    record_ts       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_orders_customer_date UNIQUE (customer_id, order_date)
+    -- one customer can't legitimately place two orders at the exact same
+    -- timestamp; this guard makes the DML inserts safely idempotent
+    -- via ON CONFLICT and protects against accidental duplicates.
 );
 
 
@@ -559,10 +563,15 @@ WHERE NOT EXISTS (
 
 -- ============================================================
 -- orders + order_items
--- I use a CTE with RETURNING here so I don't have to look up
--- the order_id by joining on customer + order_date later. The
--- RETURNING gives me exactly the IDs I just inserted, which is
--- safer than guessing them by timestamp.
+-- I split this into 3 separate statements (instead of a single
+-- CTE chain) so the script is fully rerunnable:
+--   Step 1: insert order headers, ON CONFLICT skips duplicates
+--           on (customer_id, order_date).
+--   Step 2: insert line items, looking up order_id by JOIN on
+--           the orders table itself, ON CONFLICT skips duplicates
+--           on (order_id, product_id).
+--   Step 3: recompute total_amount from order_items so the totals
+--           are always consistent, even on a rerun.
 --
 -- Note: order_items.line_total is GENERATED ALWAYS AS, so I
 -- don't include it in the INSERT. Postgres calculates it
@@ -571,74 +580,76 @@ WHERE NOT EXISTS (
 -- All order dates fall in Feb–Apr 2026 (last 3 months as of
 -- today, 2026-04-26).
 -- ============================================================
+-- Step 1: insert order headers. ON CONFLICT skips orders that already
+-- exist (matched on customer_id + order_date via uq_orders_customer_date),
+-- so this is safely rerunnable.
+INSERT INTO orders (customer_id, employee_id, warehouse_id, order_date, status, total_amount)
+SELECT c.customer_id, e.employee_id, w.warehouse_id,
+       o.order_date::TIMESTAMPTZ, o.status, 0
+FROM (VALUES
+    ('+998901234567', '+998901114455', 'Tashkent Central Warehouse', '2026-02-05 11:00:00+05', 'delivered'),
+    ('+998712345678', '+998971234455', 'Yunusobod Storage Hub',      '2026-02-12 14:30:00+05', 'delivered'),
+    ('+998931112233', '+998901567788', 'Sergeli Logistics Center',   '2026-02-20 10:15:00+05', 'delivered'),
+    ('+998901239999', '+998901114455', 'Tashkent Central Warehouse', '2026-03-03 16:45:00+05', 'delivered'),
+    ('+998971230000', '+998971234455', 'Chilonzor Branch Warehouse', '2026-03-15 12:00:00+05', 'shipped'),
+    ('+998935551122', '+998901114455', 'Yunusobod Storage Hub',      '2026-03-25 09:30:00+05', 'delivered'),
+    ('+998997773344', '+998901567788', 'Tashkent Central Warehouse', '2026-04-05 15:20:00+05', 'shipped'),
+    ('+998951115566', '+998971234455', 'Sergeli Logistics Center',   '2026-04-15 11:50:00+05', 'pending')
+) AS o(customer_phone, employee_phone, warehouse_name, order_date, status)
+JOIN customers c  ON c.phone = o.customer_phone
+JOIN employees e  ON e.phone = o.employee_phone
+JOIN warehouses w ON w.name  = o.warehouse_name
+ON CONFLICT (customer_id, order_date) DO NOTHING;
 
-WITH inserted_orders AS (
-    INSERT INTO orders (customer_id, employee_id, warehouse_id, order_date, status, total_amount)
-    SELECT c.customer_id, e.employee_id, w.warehouse_id,
-           o.order_date::TIMESTAMPTZ, o.status, 0  -- total filled in below
-    FROM (VALUES
-        ('+998901234567', '+998901114455', 'Tashkent Central Warehouse', '2026-02-05 11:00:00+05', 'delivered'),
-        ('+998712345678', '+998971234455', 'Yunusobod Storage Hub',      '2026-02-12 14:30:00+05', 'delivered'),
-        ('+998931112233', '+998901567788', 'Sergeli Logistics Center',   '2026-02-20 10:15:00+05', 'delivered'),
-        ('+998901239999', '+998901114455', 'Tashkent Central Warehouse', '2026-03-03 16:45:00+05', 'delivered'),
-        ('+998971230000', '+998971234455', 'Chilonzor Branch Warehouse', '2026-03-15 12:00:00+05', 'shipped'),
-        ('+998935551122', '+998901114455', 'Yunusobod Storage Hub',      '2026-03-25 09:30:00+05', 'delivered'),
-        ('+998997773344', '+998901567788', 'Tashkent Central Warehouse', '2026-04-05 15:20:00+05', 'shipped'),
-        ('+998951115566', '+998971234455', 'Sergeli Logistics Center',   '2026-04-15 11:50:00+05', 'pending')
-    ) AS o(customer_phone, employee_phone, warehouse_name, order_date, status)
-    JOIN customers c  ON c.phone = o.customer_phone
-    JOIN employees e  ON e.phone = o.employee_phone
-    JOIN warehouses w ON w.name  = o.warehouse_name
-    WHERE NOT EXISTS (
-        SELECT 1 FROM orders ord
-        WHERE ord.customer_id = c.customer_id
-          AND ord.order_date  = o.order_date::TIMESTAMPTZ
-    )
-    RETURNING order_id, customer_id, order_date
-),
-inserted_items AS (
-    INSERT INTO order_items (order_id, product_id, quantity, unit_price)
-    SELECT io.order_id, p.product_id, oi.qty::INTEGER, p.price
-    FROM (VALUES
-        -- order 1 (Jasur, 2026-02-05): 1 Samsung fridge + 1 Beko microwave
-        ('+998901234567', '2026-02-05 11:00:00+05', 'Samsung', 'RB37K5440SS',    1),
-        ('+998901234567', '2026-02-05 11:00:00+05', 'Beko',    'MCF25210X',      1),
-        -- order 2 (Nilufar, 2026-02-12): 1 LG fridge + 1 Samsung washing machine
-        ('+998712345678', '2026-02-12 14:30:00+05', 'LG',      'GR-B459SLCL',    1),
-        ('+998712345678', '2026-02-12 14:30:00+05', 'Samsung', 'WW80T4040EE',    1),
-        -- order 3 (Bobur, 2026-02-20): 2 Artel washers
-        ('+998931112233', '2026-02-20 10:15:00+05', 'Artel',   'TF-50WM',        2),
-        -- order 4 (Dilnoza, 2026-03-03): 1 Samsung TV + 1 Bosch vacuum
-        ('+998901239999', '2026-03-03 16:45:00+05', 'Samsung', 'UE55AU7100UXCE', 1),
-        ('+998901239999', '2026-03-03 16:45:00+05', 'Bosch',   'BGS05A220',      1),
-        -- order 5 (Otabek, 2026-03-15): 1 LG TV
-        ('+998971230000', '2026-03-15 12:00:00+05', 'LG',      '50UQ7500PSF',    1),
-        -- order 6 (Madina, 2026-03-25): 2 Haier ACs + 1 Beko microwave
-        ('+998935551122', '2026-03-25 09:30:00+05', 'Haier',   'HSU-12HEK03',    2),
-        ('+998935551122', '2026-03-25 09:30:00+05', 'Beko',    'MCF25210X',      1),
-        -- order 7 (Kamol, 2026-04-05): 3 Artel vacuums
-        ('+998997773344', '2026-04-05 15:20:00+05', 'Artel',   'VC-1800',        3),
-        -- order 8 (Sevara, 2026-04-15): 1 Samsung washing machine + 1 Artel vacuum
-        ('+998951115566', '2026-04-15 11:50:00+05', 'Samsung', 'WW80T4040EE',    1),
-        ('+998951115566', '2026-04-15 11:50:00+05', 'Artel',   'VC-1800',        1)
-    ) AS oi(customer_phone, order_date, brand, model, qty)
-    JOIN customers c    ON c.phone = oi.customer_phone
-    JOIN inserted_orders io
-                        ON io.customer_id = c.customer_id
-                       AND io.order_date  = oi.order_date::TIMESTAMPTZ
-    JOIN products p     ON p.brand = oi.brand AND p.model = oi.model
-    RETURNING order_id, line_total
-)
--- update each order's total_amount with the sum of its lines
+
+-- Step 2: insert order line items. I look up the order_id from the
+-- orders table by JOIN (not from a CTE) so this works on first run AND
+-- on rerun. ON CONFLICT on the existing uq_order_items_order_product
+-- constraint silently skips items that are already there.
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+SELECT ord.order_id, p.product_id, oi.qty::INTEGER, p.price
+FROM (VALUES
+    -- order 1 (Jasur, 2026-02-05)
+    ('+998901234567', '2026-02-05 11:00:00+05', 'Samsung', 'RB37K5440SS',    1),
+    ('+998901234567', '2026-02-05 11:00:00+05', 'Beko',    'MCF25210X',      1),
+    -- order 2 (Nilufar, 2026-02-12)
+    ('+998712345678', '2026-02-12 14:30:00+05', 'LG',      'GR-B459SLCL',    1),
+    ('+998712345678', '2026-02-12 14:30:00+05', 'Samsung', 'WW80T4040EE',    1),
+    -- order 3 (Bobur, 2026-02-20)
+    ('+998931112233', '2026-02-20 10:15:00+05', 'Artel',   'TF-50WM',        2),
+    -- order 4 (Dilnoza, 2026-03-03)
+    ('+998901239999', '2026-03-03 16:45:00+05', 'Samsung', 'UE55AU7100UXCE', 1),
+    ('+998901239999', '2026-03-03 16:45:00+05', 'Bosch',   'BGS05A220',      1),
+    -- order 5 (Otabek, 2026-03-15)
+    ('+998971230000', '2026-03-15 12:00:00+05', 'LG',      '50UQ7500PSF',    1),
+    -- order 6 (Madina, 2026-03-25)
+    ('+998935551122', '2026-03-25 09:30:00+05', 'Haier',   'HSU-12HEK03',    2),
+    ('+998935551122', '2026-03-25 09:30:00+05', 'Beko',    'MCF25210X',      1),
+    -- order 7 (Kamol, 2026-04-05)
+    ('+998997773344', '2026-04-05 15:20:00+05', 'Artel',   'VC-1800',        3),
+    -- order 8 (Sevara, 2026-04-15)
+    ('+998951115566', '2026-04-15 11:50:00+05', 'Samsung', 'WW80T4040EE',    1),
+    ('+998951115566', '2026-04-15 11:50:00+05', 'Artel',   'VC-1800',        1)
+) AS oi(customer_phone, order_date, brand, model, qty)
+JOIN customers c  ON c.phone = oi.customer_phone
+JOIN orders ord   ON ord.customer_id = c.customer_id
+                 AND ord.order_date  = oi.order_date::TIMESTAMPTZ
+JOIN products p   ON p.brand = oi.brand AND p.model = oi.model
+ON CONFLICT (order_id, product_id) DO NOTHING;
+
+
+-- Step 3: recompute total_amount for each order from its actual line items.
+-- Reading from order_items directly (not from a CTE) keeps this idempotent —
+-- on rerun it just re-confirms the totals are correct.
 UPDATE orders o
 SET total_amount = sub.total
 FROM (
     SELECT order_id, SUM(line_total) AS total
-    FROM inserted_items
+    FROM order_items
     GROUP BY order_id
 ) sub
-WHERE o.order_id = sub.order_id;
-
+WHERE o.order_id = sub.order_id
+  AND o.total_amount IS DISTINCT FROM sub.total;
 
 -- quick sanity check: every table should have 6+ rows
 SELECT 'categories'         AS tbl, COUNT(*) AS rows FROM categories
@@ -692,6 +703,25 @@ BEGIN
     IF p_column_name NOT IN ('brand', 'model', 'price', 'warranty_months', 'color', 'category_id') THEN
         RAISE EXCEPTION 'Column "%" is not allowed to be updated by this function', p_column_name;
     END IF;
+
+    -- validating the new value matches the column's data type before we
+    -- try to apply it. Without this, passing 'abc' for a numeric column
+    -- throws a raw cast error - this gives the caller a clear message instead.
+    IF p_column_name = 'price' THEN
+        BEGIN
+            PERFORM p_new_value::NUMERIC;
+        EXCEPTION WHEN invalid_text_representation THEN
+            RAISE EXCEPTION 'Invalid numeric value "%" for column price', p_new_value;
+        END;
+    ELSIF p_column_name IN ('warranty_months', 'category_id') THEN
+        BEGIN
+            PERFORM p_new_value::INTEGER;
+        EXCEPTION WHEN invalid_text_representation THEN
+            RAISE EXCEPTION 'Invalid integer value "%" for column %', p_new_value, p_column_name;
+        END;
+    END IF;
+    -- text columns (brand, model, color) accept any string, so no check needed.
+
 
     -- check the row actually exists before trying to update
     IF NOT EXISTS (SELECT 1 FROM appliance_store.products WHERE product_id = p_product_id) THEN
@@ -912,7 +942,7 @@ BEGIN
         -- "role cannot be dropped because some objects depend on it"
         EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA appliance_store FROM appliance_manager';
         EXECUTE 'REVOKE ALL ON SCHEMA appliance_store FROM appliance_manager';
-        EXECUTE 'REVOKE ALL ON DATABASE appliance_store FROM appliance_manager';
+        EXECUTE format('REVOKE ALL ON DATABASE %I FROM appliance_manager', current_database());
         EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA appliance_store REVOKE SELECT ON TABLES FROM appliance_manager';
         DROP ROLE appliance_manager;
     END IF;
@@ -923,7 +953,13 @@ CREATE ROLE appliance_manager LOGIN PASSWORD 'ManagerPass2026!'
     CONNECTION LIMIT 5;
 
 -- connect privilege: needed to log into the database at all
-GRANT CONNECT ON DATABASE appliance_store TO appliance_manager;
+-- using current_database() so the script works regardless of what the
+-- database is actually called. GRANT requires a literal name, so I wrap
+-- it in EXECUTE format(...) inside a DO block.
+DO $$
+BEGIN
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO appliance_manager', current_database());
+END $$;
 
 -- usage on schema: needed to "see" tables exist
 GRANT USAGE ON SCHEMA appliance_store TO appliance_manager;
