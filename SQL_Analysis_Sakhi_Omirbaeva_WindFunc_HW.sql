@@ -61,7 +61,7 @@ SELECT
     -- two decimal places for the amount
     TO_CHAR(r.amount_sold, 'FM9999990.00')                               AS amount_sold,
     -- four decimals + " %" suffix; FM strips padding spaces
-    TO_CHAR(r.amount_sold / r.channel_total * 100, 'FM999.0000') || ' %' AS sales_percentage
+    TO_CHAR(r.amount_sold / r.channel_total * 100, 'FM990.0000') || ' %' AS sales_percentage
 FROM ranked r
 JOIN sh.channels  ch ON ch.channel_id = r.channel_id
 JOIN sh.customers c  ON c.cust_id     = r.cust_id
@@ -81,7 +81,7 @@ ORDER BY ch.channel_desc, r.amount_sold DESC;
      four columns. crosstab is cleaner than a pile of CASE expressions
      when the number of pivot values is small and known.
    - The source query inside crosstab returns (product_name, quarter,
-     quarterly_sum) — exactly the (row_name, category, value) shape
+     quarterly_sum) - exactly the (row_name, category, value) shape
      crosstab expects.
    - I add YEAR_SUM as q1+q2+q3+q4 wrapped in COALESCE, because some
      products did not sell in every quarter (e.g. 64MB Memory Card has
@@ -133,53 +133,69 @@ FROM crosstab(
 ORDER BY (COALESCE(q1,0) + COALESCE(q2,0) + COALESCE(q3,0) + COALESCE(q4,0)) DESC;
 
 
-
 /* 
    TASK 3
-   Top 300 customers by total sales across 1998, 1999 and 2001,
-   broken down by sales channel (only that channel's purchases shown).
+   Top 300 customers in each of 1998, 1999, and 2001, broken down
+   by sales channel (only that channel's purchases shown).
 
-   My interpretation of the task:
-   - "Top 300 based on total sales in the years 1998, 1999, and 2001"
-     means I sum each customer's sales over those three years combined,
-     then take the 300 customers with the highest combined total.
-     ("Total sales in the years X, Y, Z" reads to me as one combined
-     figure, not three separate per-year rankings.)
+   My interpretation of the task (revised after mentor feedback on git):
+   - "Top 300 in 1998, 1999 AND 2001" means a customer must rank in
+     the top 300 separately for EACH of those three years, not in the
+     top 300 of a single combined-three-year total. The "AND" is the
+     key word — it's an intersection, not a sum.
    - "Categorize the customers based on their sales channels" and
      "Include in the report only purchases made on the channel
-     specified" tell me the output is split by channel: a customer who
-     bought on three channels appears in three rows, each row showing
-     only that channel's amount.
+     specified" tell me the output is split by channel: a customer
+     who bought on three channels appears in three rows, each row
+     showing only that channel's amount.
 
-   Window function used:
-   - DENSE_RANK() OVER (ORDER BY total_sales DESC) to identify the
-     top 300. DENSE_RANK so ties at position 300 are all kept (no gaps).
+   My approach:
+   - First CTE: aggregate sales per (customer, year) for the three
+     years of interest.
+   - Second CTE: rank customers within each year using
+     DENSE_RANK() OVER (PARTITION BY calendar_year ORDER BY total DESC).
+     DENSE_RANK keeps ties at the boundary without leaving gaps.
+   - Third CTE: keep only customers who appear at rank <= 300 in all
+     three years. The HAVING COUNT(DISTINCT calendar_year) = 3 enforces
+     the "in every year" requirement — this is the intersection step.
+   - Final SELECT: for those qualifying customers, sum sales per
+     channel (limited to the three years) so the output is broken
+     down by channel as the spec requires.
+   - I've provided a Option2 below that uses
+     ROW_NUMBER() instead of DENSE_RANK() for a strict "exactly 300"
+     cutoff, in case the assignment prefers that interpretation.
+
 */
-
-WITH combined_sales AS (
-    -- step 1: total sales per customer across the three required years
+WITH yearly_sales AS (
+    -- one row per (customer, year)
     SELECT
         s.cust_id,
-        SUM(s.amount_sold) AS total_sales
+        t.calendar_year,
+        SUM(s.amount_sold) AS yearly_total
     FROM sh.sales s
     JOIN sh.times t USING (time_id)
     WHERE t.calendar_year IN (1998, 1999, 2001)
-    GROUP BY s.cust_id
+    GROUP BY s.cust_id, t.calendar_year
 ),
-ranked_customers AS (
-    -- step 2: rank by combined sales — single ranking, no PARTITION BY
+ranked_per_year AS (
     SELECT
         cust_id,
-        total_sales,
-        DENSE_RANK() OVER (ORDER BY total_sales DESC) AS rnk
-    FROM combined_sales
+        calendar_year,
+        yearly_total,
+        DENSE_RANK() OVER (
+            PARTITION BY calendar_year
+            ORDER BY yearly_total DESC
+        ) AS rnk
+    FROM yearly_sales
 ),
-top_300 AS (
-    SELECT cust_id FROM ranked_customers WHERE rnk <= 300
+top_300_all_years AS (
+    -- must be top 300 in every one of the three years
+    SELECT cust_id
+    FROM ranked_per_year
+    WHERE rnk <= 300
+    GROUP BY cust_id
+    HAVING COUNT(DISTINCT calendar_year) = 3
 )
--- step 3: for each qualifying customer, sum their sales per channel
--- but only count purchases that happened on that channel and in the
--- three years of interest.
 SELECT
     ch.channel_desc,
     c.cust_id,
@@ -190,11 +206,76 @@ FROM sh.sales      s
 JOIN sh.times      t  USING (time_id)
 JOIN sh.channels   ch USING (channel_id)
 JOIN sh.customers  c  USING (cust_id)
-WHERE s.cust_id IN (SELECT cust_id FROM top_300)
+WHERE s.cust_id IN (SELECT cust_id FROM top_300_all_years)
   AND t.calendar_year IN (1998, 1999, 2001)
 GROUP BY ch.channel_desc, c.cust_id, c.cust_last_name, c.cust_first_name
 ORDER BY ch.channel_desc, SUM(s.amount_sold) DESC;
+/* 
+   TASK 3 Option2: strict "exactly 300" version
 
+   I kept the DENSE_RANK version above as the primary solution because
+   "top 300" in business reports typically includes ties (cutting a
+   customer off arbitrarily when they tie with the 300th by sales
+   feels wrong). This second variant exists in case the assignment
+   expects exactly 300 customers per year, no more.
+
+   What changes vs Option1:
+   - I swap DENSE_RANK() for ROW_NUMBER(). ROW_NUMBER assigns a unique
+     position to every row, so ties are broken arbitrarily and the
+     top-300 cutoff produces exactly 300 customers per year.
+   - To make the tie-breaking deterministic (same input to same output
+     across runs), I add cust_id as a secondary ORDER BY. Without it,
+     two customers with identical yearly_total could swap positions
+     between executions.
+   - Everything else - the per-year ranking logic, the
+     COUNT(DISTINCT calendar_year) = 3 intersection, the final
+     channel-level aggregation — stays identical to Option1.
+*/
+
+WITH yearly_sales AS (
+    SELECT
+        s.cust_id,
+        t.calendar_year,
+        SUM(s.amount_sold) AS yearly_total
+    FROM sh.sales s
+    JOIN sh.times t USING (time_id)
+    WHERE t.calendar_year IN (1998, 1999, 2001)
+    GROUP BY s.cust_id, t.calendar_year
+),
+ranked_per_year AS (
+    SELECT
+        cust_id,
+        calendar_year,
+        yearly_total,
+        -- ROW_NUMBER for a strict 300-per-year cutoff; cust_id as a
+        -- tie-breaker so the result is deterministic across runs.
+        ROW_NUMBER() OVER (
+            PARTITION BY calendar_year
+            ORDER BY yearly_total DESC, cust_id
+        ) AS rnk
+    FROM yearly_sales
+),
+top_300_all_years AS (
+    SELECT cust_id
+    FROM ranked_per_year
+    WHERE rnk <= 300
+    GROUP BY cust_id
+    HAVING COUNT(DISTINCT calendar_year) = 3
+)
+SELECT
+    ch.channel_desc,
+    c.cust_id,
+    c.cust_last_name,
+    c.cust_first_name,
+    TO_CHAR(SUM(s.amount_sold), 'FM999999990.00') AS amount_sold
+FROM sh.sales      s
+JOIN sh.times      t  USING (time_id)
+JOIN sh.channels   ch USING (channel_id)
+JOIN sh.customers  c  USING (cust_id)
+WHERE s.cust_id IN (SELECT cust_id FROM top_300_all_years)
+  AND t.calendar_year IN (1998, 1999, 2001)
+GROUP BY ch.channel_desc, c.cust_id, c.cust_last_name, c.cust_first_name
+ORDER BY ch.channel_desc, SUM(s.amount_sold) DESC;
 
 
 /* 
@@ -218,8 +299,8 @@ SELECT
     t.calendar_month_desc,
     p.prod_category,
     -- FILTER clause: like a CASE WHEN inside the aggregate, but cleaner
-    SUM(s.amount_sold) FILTER (WHERE co.country_region = 'Americas') AS "Americas SALES",
-    SUM(s.amount_sold) FILTER (WHERE co.country_region = 'Europe')   AS "Europe SALES"
+    TO_CHAR(SUM(s.amount_sold) FILTER (WHERE co.country_region = 'Americas'), 'FM999,999,990') AS "Americas SALES",
+    TO_CHAR(SUM(s.amount_sold) FILTER (WHERE co.country_region = 'Europe'),   'FM999,999,990') AS "Europe SALES"
 FROM sh.sales      s
 JOIN sh.products   p  ON p.prod_id    = s.prod_id
 JOIN sh.times      t  ON t.time_id    = s.time_id
@@ -228,4 +309,49 @@ JOIN sh.countries  co ON co.country_id = cu.country_id
 WHERE t.calendar_month_desc IN ('2000-01', '2000-02', '2000-03')
   AND co.country_region IN ('Americas', 'Europe')
 GROUP BY t.calendar_month_desc, p.prod_category
+ORDER BY t.calendar_month_desc, p.prod_category;
+
+/* 
+   TASK 4 Option2: window-function version
+
+   I kept the FILTER-clause version above as the primary solution
+   because it reads cleaner for a simple two-column pivot. This second
+   variant exists to satisfy the "use a window function" requirement
+   of the assignment.
+
+   My approach:
+   - I move the regional split inside a CASE expression (one CASE per
+     target column) and wrap each in SUM() OVER (PARTITION BY month,
+     category). Rows from "wrong" regions contribute 0, so the partition
+     sum equals the regional total — same numbers as the FILTER version.
+   - Because window functions don't collapse rows, the same
+     (month, category) pair appears once per underlying sale. I use
+     SELECT DISTINCT to deduplicate down to one row per pair.
+     (An alternative would be GROUP BY, but then I couldn't use the
+     window function directly — it would have to wrap an aggregate.
+     DISTINCT is the lighter fix here.)
+   - ELSE 0 instead of leaving NULL, so the SUM behaves predictably
+     even if a (month, category) pair has zero sales in one region.
+   - Same TO_CHAR formatting as Option1 for consistent output.
+*/
+SELECT DISTINCT
+    t.calendar_month_desc,
+    p.prod_category,
+    TO_CHAR(
+        SUM(CASE WHEN co.country_region = 'Americas' THEN s.amount_sold ELSE 0 END)
+            OVER (PARTITION BY t.calendar_month_desc, p.prod_category),
+        'FM999,999,990'
+    ) AS "Americas SALES",
+    TO_CHAR(
+        SUM(CASE WHEN co.country_region = 'Europe' THEN s.amount_sold ELSE 0 END)
+            OVER (PARTITION BY t.calendar_month_desc, p.prod_category),
+        'FM999,999,990'
+    ) AS "Europe SALES"
+FROM sh.sales      s
+JOIN sh.products   p  ON p.prod_id    = s.prod_id
+JOIN sh.times      t  ON t.time_id    = s.time_id
+JOIN sh.customers  cu ON cu.cust_id   = s.cust_id
+JOIN sh.countries  co ON co.country_id = cu.country_id
+WHERE t.calendar_month_desc IN ('2000-01', '2000-02', '2000-03')
+  AND co.country_region IN ('Americas', 'Europe')
 ORDER BY t.calendar_month_desc, p.prod_category;
