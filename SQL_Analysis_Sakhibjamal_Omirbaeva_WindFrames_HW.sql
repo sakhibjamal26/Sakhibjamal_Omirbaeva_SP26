@@ -37,6 +37,13 @@
 --    + " %". I matched the sample format and kept the actual data
 --    precision (.86 cents etc.) instead of rounding away the kopecks.
 
+--    NULL safety on the previous-period columns: as noted by mentor, with
+--    the 1998-2001 scope every 1999 row finds its prior year, so in
+--    practice nothing is NULL. But to make the intent explicit (and so
+--    the report doesn't go silently blank if someone later narrows the
+--    scope to just 1999-2001), I'm wrapping the previous-period and
+--   diff columns in COALESCE with an 'n/a' fallback.
+
 WITH yearly_sales AS (
     -- Step 1: aggregate raw sales rows up to (region, year, channel) level.
     -- I need 1998 in the scope so that LAG can find a previous year for 1999.
@@ -99,8 +106,8 @@ SELECT
     -- the trailing 0 in '0D00' makes sure we always show 2 decimals.
     TO_CHAR(amount_sold,                       'FM9G999G999G990D00') || ' $' AS amount_sold,
     TO_CHAR(pct_by_channels,                   'FM990D00')           || ' %' AS "% BY CHANNELS",
-    TO_CHAR(pct_previous_period,               'FM990D00')           || ' %' AS "% PREVIOUS PERIOD",
-    TO_CHAR(pct_by_channels - pct_previous_period, 'FM990D00')       || ' %' AS "% DIFF"
+    COALESCE(TO_CHAR(pct_previous_period,                'FM990D00') || ' %','n/a') AS "% PREVIOUS PERIOD",
+    COALESCE(TO_CHAR(pct_by_channels - pct_previous_period, 'FM990D00') || ' %', 'n/a') AS "% DIFF"
 FROM with_lag
 WHERE calendar_year BETWEEN 1999 AND 2001   -- now we drop 1998 from the output
 ORDER BY country_region ASC,
